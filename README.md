@@ -1,45 +1,106 @@
-Overview
-========
+# Titanic Survival Prediction MLOps Pipeline
 
-Welcome to Astronomer! This project was generated after you ran 'astro dev init' using the Astronomer CLI. This readme describes the contents of the project, as well as how to run Apache Airflow on your local machine.
+End-to-end MLOps workflow that ingests Titanic passenger records, engineers features, trains a Random Forest classifier, and serves real-time survival predictions with production-grade monitoring and data-drift detection.
 
-Project Contents
-================
+## Architecture
 
-Your Astro project contains the following files and folders:
+- **Airflow ingestion**: `extract_data_from_gcp` DAG moves raw CSV data from Google Cloud Storage into a Postgres table.  
+- **Data processing**: `DataProcessing` pipeline cleans data, engineers features, balances the target with SMOTE, and pushes features into Redis as an online feature store.  
+- **Model training**: `TrainingModel` pulls features from Redis, performs hyperparameter tuning, trains a RandomForest, and stores the artifact under `artifacts/model/random_forest_model.pkl`.  
+- **Inference service**: Flask app (`application.py`) loads the trained model, streams features from web forms, detects drift with Alibi Detect, and exposes Prometheus metrics.  
+- **Observability**: Prometheus scrapes `/metrics`; Grafana dashboards can be provisioned via `docker-compose.yml`.  
 
-- dags: This folder contains the Python files for your Airflow DAGs. By default, this directory includes one example DAG:
-    - `example_astronauts`: This DAG shows a simple ETL pipeline example that queries the list of astronauts currently in space from the Open Notify API and prints a statement for each astronaut. The DAG uses the TaskFlow API to define tasks in Python, and dynamic task mapping to dynamically print a statement for each astronaut. For more on how this DAG works, see our [Getting started tutorial](https://www.astronomer.io/docs/learn/get-started-with-airflow).
-- Dockerfile: This file contains a versioned Astro Runtime Docker image that provides a differentiated Airflow experience. If you want to execute other commands or overrides at runtime, specify them here.
-- include: This folder contains any additional files that you want to include as part of your project. It is empty by default.
-- packages.txt: Install OS-level packages needed for your project by adding them to this file. It is empty by default.
-- requirements.txt: Install Python packages needed for your project by adding them to this file. It is empty by default.
-- plugins: Add custom or community plugins for your project to this file. It is empty by default.
-- airflow_settings.yaml: Use this local-only file to specify Airflow Connections, Variables, and Pools instead of entering them in the Airflow UI as you develop DAGs in this project.
+```text
+.
+├── application.py             # Flask inference service with drift detection and metrics
+├── pipeline/
+│   └── training_pipeline.py    # Orchestrates ingestion → processing → training
+├── src/
+│   ├── data_ingestion.py       # Pull Titanic data from Postgres
+│   ├── data_processing.py      # Feature engineering, SMOTE balancing, Redis writes
+│   ├── model_training.py       # RandomForest training + hyperparameter search
+│   ├── feature_store.py        # Redis client helpers
+│   ├── logger.py               # Structured logging utility
+│   └── custom_exception.py     # Unified exception formatting
+├── dags/
+│   ├── extract_data_from_gcp.py   # Airflow DAG to load raw data into Postgres
+│   └── exampledag.py              # Astro starter example (kept for reference)
+├── templates/ & static/        # Flask UI
+├── docker-compose.yml          # Prometheus + Grafana stack
+├── prometheus.yml              # Prometheus scrape config for the Flask app
+├── config/                     # Paths and Postgres credentials
+├── artifacts/                  # Raw data snapshots and trained model
+└── tests/                      # Pytest DAG smoke tests
+```
 
-Deploy Your Project Locally
-===========================
+## Getting Started
 
-Start Airflow on your local machine by running 'astro dev start'.
+### Prerequisites
+- Python 3.10+
+- Local or containerized instances of **Postgres** and **Redis**
+- Optional: Docker (for Prometheus/Grafana), Apache Airflow (if you want to run the ingestion DAG)
 
-This command will spin up five Docker containers on your machine, each for a different Airflow component:
+### Installation
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+pip install -r requirements.txt
+```
 
-- Postgres: Airflow's Metadata Database
-- Scheduler: The Airflow component responsible for monitoring and triggering tasks
-- DAG Processor: The Airflow component responsible for parsing DAGs
-- API Server: The Airflow component responsible for serving the Airflow UI and API
-- Triggerer: The Airflow component responsible for triggering deferred tasks
+Update `config/database_config.py` to match your Postgres instance. Ensure Redis is reachable at `localhost:6379` or adjust the defaults in `src/feature_store.py`.
 
-When all five containers are ready the command will open the browser to the Airflow UI at http://localhost:8080/. You should also be able to access your Postgres Database at 'localhost:5432/postgres' with username 'postgres' and password 'postgres'.
+## Data & Feature Pipelines
 
-Note: If you already have either of the above ports allocated, you can either [stop your existing Docker containers or change the port](https://www.astronomer.io/docs/astro/cli/troubleshoot-locally#ports-are-not-available-for-my-local-airflow-webserver).
+1. **Load raw data into Postgres**
+   - Configure the Airflow connection `postgres_default` for your database.
+   - Trigger the `extract_titanic_data` DAG (`dags/extract_data_from_gcp.py`) to pull `TitanicDataset.csv` from GCS into the `titanic` table.
 
-Deploy Your Project to Astronomer
-=================================
+   *Alternative*: place CSVs under `artifacts/raw/` manually if you prefer to skip Airflow.
 
-If you have an Astronomer account, pushing code to a Deployment on Astronomer is simple. For deploying instructions, refer to Astronomer documentation: https://www.astronomer.io/docs/astro/deploy-code/
+2. **Run the training pipeline**
+   ```bash
+   python pipeline/training_pipeline.py
+   ```
+   This executes:
+   - Database ingestion (`src/data_ingestion.py`)
+   - Feature engineering + SMOTE balancing + Redis writes (`src/data_processing.py`)
+   - RandomForest training and artifact persistence (`src/model_training.py`)
 
-Contact
-=======
+3. **Validate artifacts**
+   - The trained model will be stored in `artifacts/model/random_forest_model.pkl`.
+   - Redis should now contain passenger features keyed by `entity:{PassengerId}:features`.
 
-The Astronomer CLI is maintained with love by the Astronomer team. To report a bug or suggest a change, reach out to our support.
+## Serving Predictions
+
+```bash
+python application.py
+```
+
+- UI served at `http://localhost:5000/` (renders `templates/index.html`)
+- Predictions posted to `/predict`
+- Prometheus-formatted metrics at `/metrics`
+- Drift detection (Kolmogorov–Smirnov) is triggered on every request, incrementing a Prometheus counter when drift is detected.
+
+To expose metrics dashboards:
+```bash
+docker-compose up -d
+```
+Prometheus listens on `http://localhost:9090`, Grafana on `http://localhost:3000` (default credentials `admin/admin`).
+
+## Testing
+
+Smoke tests for DAG imports and configuration:
+```bash
+pytest tests
+```
+
+## Project Highlights
+- **Feature Store Integration**: Redis keeps online features synchronized with training data for low-latency lookups.
+- **Data Drift Monitoring**: Alibi Detect’s KS drift detector runs in real time against a reference window populated from Redis.
+- **Operational Metrics**: Prometheus counters track inference volume and drift events; ready for Grafana dashboards.
+- **Automation Ready**: Airflow DAG and Python pipeline scripts cover ingestion-to-training automation for reproducibility.
+
+## Roadmap Ideas
+- Add CI/CD for automatic testing and deployment (GitHub Actions).
+- Parameterize configuration via environment variables instead of hardcoded values.
+- Extend monitoring with model accuracy tracking and alerting via Grafana.
